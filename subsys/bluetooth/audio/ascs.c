@@ -337,10 +337,16 @@ static void ascs_iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 {
 	struct bt_audio_ep *ep = CONTAINER_OF(chan, struct bt_audio_ep, iso);
 	struct bt_audio_stream *stream = ep->stream;
-	struct bt_audio_stream_ops *ops = stream->ops;
+	struct bt_audio_stream_ops *ops;
 
 	BT_DBG("stream %p ep %p reason 0x%02x", chan, ep, reason);
 
+	if (stream == NULL) {
+		/* No stream for endpoint */
+		return;
+	}
+
+	ops = stream->ops;
 	if (ops != NULL && ops->stopped != NULL) {
 		ops->stopped(stream);
 	} else {
