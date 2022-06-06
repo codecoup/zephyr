@@ -287,10 +287,18 @@ static void ascs_iso_recv(struct bt_iso_chan *chan,
 			  struct net_buf *buf)
 {
 	struct bt_audio_ep *ep = CONTAINER_OF(chan, struct bt_audio_ep, iso);
-	struct bt_audio_stream_ops *ops = ep->stream->ops;
+	struct bt_audio_stream_ops *ops;
+
+	/* Drop the ISO data if in Idle or Releasing state */
+	if (ep->status.state == BT_AUDIO_EP_STATE_IDLE ||
+	    ep->status.state == BT_AUDIO_EP_STATE_RELEASING) {
+		net_buf_unref(buf);
+		return;
+	}
 
 	BT_DBG("stream %p ep %p len %zu", chan, ep, net_buf_frags_len(buf));
 
+	ops = ep->stream->ops;
 	if (ops != NULL && ops->recv != NULL) {
 		ops->recv(ep->stream, info, buf);
 	} else {
