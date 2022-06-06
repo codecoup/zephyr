@@ -522,15 +522,14 @@ static void csis_security_changed(struct bt_conn *conn, bt_security_t level,
 #if defined(CONFIG_BT_EXT_ADV)
 static void csis_connected(struct bt_conn *conn, uint8_t err)
 {
-	if (err == BT_HCI_ERR_SUCCESS) {
-		for (int i = 0; i < ARRAY_SIZE(csis_insts); i++) {
-			struct bt_csis *csis = &csis_insts[i];
+	if (err != BT_HCI_ERR_SUCCESS) {
+		return;
+	}
 
-			csis->srv.conn_cnt++;
+	for (int i = 0; i < ARRAY_SIZE(csis_insts); i++) {
+		atomic_val_t old = atomic_inc(&csis_insts[i].srv.conn_cnt);
 
-			__ASSERT(csis->srv.conn_cnt <= CONFIG_BT_MAX_CONN,
-				"Invalid csis->srv.conn_cnt value");
-		}
+		__ASSERT(old < CONFIG_BT_MAX_CONN, "conn_cnt_inc: Invalid csis->srv.conn_cnt value");
 	}
 }
 
@@ -553,14 +552,15 @@ static void disconnect_adv(struct k_work *work)
 static void handle_csis_disconnect(struct bt_csis *csis, struct bt_conn *conn)
 {
 #if defined(CONFIG_BT_EXT_ADV)
-	__ASSERT(csis->srv.conn_cnt != 0, "Invalid csis->srv.conn_cnt value");
+	atomic_val_t old = atomic_dec(&csis->srv.conn_cnt);
 
-	if (csis->srv.conn_cnt == CONFIG_BT_MAX_CONN &&
+	__ASSERT(old > 0, "conn_cnt_dec: Invalid csis->srv.conn_cnt value");
+
+	if (atomic_get(&csis->srv.conn_cnt) < CONFIG_BT_MAX_CONN &&
 	    csis->srv.adv_enabled) {
 		/* A connection spot opened up */
 		k_work_submit(&csis->srv.work);
 	}
-	csis->srv.conn_cnt--;
 #endif /* CONFIG_BT_EXT_ADV */
 
 	BT_DBG("Non-bonded device");
@@ -780,7 +780,7 @@ static void adv_connected(struct bt_le_ext_adv *adv,
 	__ASSERT(csis != NULL, "Could not find CSIS instance by ADV set %p",
 		 adv);
 
-	if (csis->srv.conn_cnt < CONFIG_BT_MAX_CONN &&
+	if (atomic_get(&csis->srv.conn_cnt) < CONFIG_BT_MAX_CONN &&
 	    csis->srv.adv_enabled) {
 		int err = csis_adv_resume(csis);
 

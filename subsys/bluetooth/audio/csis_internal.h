@@ -75,7 +75,7 @@ struct bt_csis_server {
 	uint32_t age_counter;
 #endif /* CONFIG_BT_KEYS_OVERWRITE_OLDEST */
 #if defined(CONFIG_BT_EXT_ADV)
-	uint8_t conn_cnt;
+	atomic_t conn_cnt;
 	struct bt_le_ext_adv *adv;
 	struct bt_le_ext_adv_cb adv_cb;
 	struct k_work work;
