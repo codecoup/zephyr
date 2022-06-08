@@ -240,6 +240,11 @@ int csis_adv_resume(struct bt_csis *csis)
 		return -EAGAIN;
 	}
 
+	if (csis_cbs != NULL && csis_cbs->prsi_changed != NULL) {
+		csis_cbs->prsi_changed(csis->srv.psri);
+		return 0;
+	}
+
 	ad[1].type = BT_DATA_CSIS_RSI;
 	ad[1].data_len = sizeof(csis->srv.psri);
 	ad[1].data = csis->srv.psri;
@@ -326,13 +331,14 @@ static ssize_t read_set_sirk(struct bt_conn *conn,
 			return BT_GATT_ERR(BT_ATT_ERR_AUTHORIZATION);
 		} else if (cb_rsp == BT_CSIS_READ_SIRK_REQ_RSP_OOB_ONLY) {
 			return BT_GATT_ERR(BT_CSIS_ERROR_SIRK_OOB_ONLY);
+		} else {
+			BT_ERR("Invalid callback response: %u", cb_rsp);
+			return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 		}
-
-		BT_ERR("Invalid callback response: %u", cb_rsp);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+	} else {
+		sirk = &csis->srv.set_sirk;
 	}
 
-	sirk = &csis->srv.set_sirk;
 
 	BT_DBG("Set sirk %sencrypted",
 	       sirk->type ==  BT_CSIS_SIRK_TYPE_PLAIN ? "not " : "");
@@ -909,13 +915,15 @@ int bt_csis_register(const struct bt_csis_register_param *param,
 	k_work_init(&inst->srv.work, disconnect_adv);
 #endif /* CONFIG_BT_EXT_ADV */
 
+	csis_cbs = param->cb;
+
 	*csis = inst;
 	return 0;
 }
 
 int bt_csis_advertise(struct bt_csis *csis, bool enable)
 {
-	int err;
+	int err = 0;
 
 	if (enable) {
 		if (csis->srv.adv_enabled) {
@@ -933,14 +941,16 @@ int bt_csis_advertise(struct bt_csis *csis, bool enable)
 		if (!csis->srv.adv_enabled) {
 			return -EALREADY;
 		}
+		if (csis_cbs == NULL || csis_cbs->prsi_changed == NULL) {
 #if defined(CONFIG_BT_EXT_ADV)
-		err = bt_le_ext_adv_stop(csis->srv.adv);
+			err = bt_le_ext_adv_stop(csis->srv.adv);
 #else
-		err = bt_le_adv_stop();
+			err = bt_le_adv_stop();
 #endif /* CONFIG_BT_EXT_ADV */
-		if (err != 0) {
-			BT_DBG("Could not stop start adv: %d", err);
-			return err;
+			if (err != 0) {
+				BT_DBG("Could not stop start adv: %d", err);
+				return err;
+			}
 		}
 		csis->srv.adv_enabled = false;
 	}
