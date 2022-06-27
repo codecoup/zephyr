@@ -21,6 +21,8 @@ manifest:
   remotes:
     - name: upstream
       url-base: https://github.com/zephyrproject-rtos
+    - name: google
+      url-base: https://github.com/google
 
   #
   # Please add items below based on alphabetical order
@@ -151,8 +153,9 @@ manifest:
       path: modules/hal/libmetal
       groups:
         - hal
-    - name: liblc3codec
-      revision: 3951cf1b71ff3be086c9b9b595e473e12301337c
+    - name: liblc3
+      remote: google
+      revision: e07f313d57347b01c04092dda00515aa6f36c9c8
       path: modules/lib/liblc3codec
     - name: littlefs
       path: modules/fs/littlefs
