@@ -437,7 +437,15 @@ static void ascs_iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 
 	ep = stream->ep;
 	if (ep->status.state == BT_AUDIO_EP_STATE_RELEASING) {
-		ascs_ep_set_state(ep, BT_AUDIO_EP_STATE_CODEC_CONFIGURED);
+		ascs_ep_unbind_audio_iso(ep);
+
+		if (ep->stream->codec != NULL) {
+			ascs_ep_set_state(ep, BT_AUDIO_EP_STATE_CODEC_CONFIGURED);
+		} else {
+			bt_audio_stream_detach(ep->stream);
+
+			ascs_ep_set_state(ep, BT_AUDIO_EP_STATE_IDLE);
+		}
 	} else {
 		int err;
 
@@ -899,14 +907,6 @@ static void ase_process(struct k_work *work)
 	ascs_ep_get_status(&ase->ep, &ase_buf);
 
 	bt_gatt_notify(ase->ascs->conn, ase->ep.server.attr, ase_buf.data, ase_buf.len);
-
-	if (ase->ep.status.state == BT_AUDIO_EP_STATE_RELEASING) {
-		__ASSERT(ase->ep.stream, "stream is NULL");
-
-		ascs_ep_unbind_audio_iso(&ase->ep);
-		bt_audio_stream_detach(ase->ep.stream);
-		ascs_ep_set_state(&ase->ep, BT_AUDIO_EP_STATE_IDLE);
-	}
 }
 
 static uint8_t ase_attr_cb(const struct bt_gatt_attr *attr, uint16_t handle,
@@ -2207,10 +2207,7 @@ static ssize_t ascs_release(struct bt_ascs *ascs, struct net_buf_simple *buf)
 		}
 
 		if (ase->ep.status.state == BT_AUDIO_EP_STATE_IDLE) {
-			BT_WARN("Invalid operation in state: %s",
-				bt_audio_ep_state_str(ase->ep.status.state));
-			ascs_cp_rsp_add(id, BT_ASCS_RELEASE_OP,
-					BT_ASCS_RSP_INVALID_ASE_STATE, BT_ASCS_REASON_NONE);
+			ascs_cp_rsp_success(ASE_ID(ase), BT_ASCS_RELEASE_OP);
 			continue;
 		}
 
