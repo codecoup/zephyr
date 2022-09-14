@@ -177,6 +177,9 @@ void ascs_ep_set_state(struct bt_audio_ep *ep, uint8_t state)
 	if (state == BT_AUDIO_EP_STATE_CODEC_CONFIGURED &&
 	    old_state != BT_AUDIO_EP_STATE_IDLE) {
 		ascs_ep_unbind_audio_iso(ep);
+	} else if (state == BT_AUDIO_EP_STATE_IDLE) {
+		ascs_ep_unbind_audio_iso(ep);
+		bt_audio_stream_detach(stream);
 	}
 }
 
@@ -884,8 +887,6 @@ static void ase_process(struct k_work *work)
 
 		if (ase->ep.iso == NULL ||
 		    ase->ep.iso->iso_chan.state == BT_ISO_STATE_DISCONNECTED) {
-			ascs_ep_unbind_audio_iso(&ase->ep);
-			bt_audio_stream_detach(stream);
 			ascs_ep_set_state(&ase->ep, BT_AUDIO_EP_STATE_IDLE);
 		} else {
 			/* Either the client or the server may disconnect the
