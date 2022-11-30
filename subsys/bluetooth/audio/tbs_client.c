@@ -109,26 +109,39 @@ static bool free_call_spot(struct bt_tbs_instance *inst)
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_ORIGINATE_CALL) */
 
-static struct bt_tbs_instance *lookup_inst_by_handle(struct bt_conn *conn,
-							 uint16_t handle)
-{
-	uint8_t conn_index;
+struct find_inst_result {
 	struct bt_tbs_server_inst *srv_inst;
+	struct bt_tbs_instance *inst;
+};
 
-	__ASSERT(conn, "NULL conn");
+static int find_inst_by_handle(uint16_t handle, struct find_inst_result *result)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(srv_insts); i++) {
+		struct bt_tbs_server_inst *srv_inst = &srv_insts[i];
 
-	conn_index = bt_conn_index(conn);
-	srv_inst = &srv_insts[conn_index];
+		for (size_t j = 0; j < ARRAY_SIZE(srv_inst->tbs_insts); j++) {
+			struct bt_tbs_instance *inst = &srv_inst->tbs_insts[j];
 
-	for (size_t i = 0; i < ARRAY_SIZE(srv_inst->tbs_insts); i++) {
-		if (srv_inst->tbs_insts[i].start_handle <= handle &&
-		    srv_inst->tbs_insts[i].end_handle >= handle) {
-			return &srv_inst->tbs_insts[i];
+			if (inst->start_handle <= handle && inst->end_handle >= handle) {
+				result->srv_inst = srv_inst;
+				result->inst = inst;
+
+				return 0;
+			}
 		}
 	}
-	BT_DBG("Could not find instance with handle 0x%04x", handle);
 
-	return NULL;
+	return -ENOENT;
+}
+
+static uint8_t tbs_server_index(const struct bt_tbs_server_inst *srv_inst)
+{
+	ptrdiff_t index = srv_inst - srv_insts;
+
+	__ASSERT(index >= 0 && index < ARRAY_SIZE(srv_insts),
+		"Invalid srv_inst pointer");
+
+	return (uint8_t)index;
 }
 
 static uint8_t net_buf_pull_call_state(struct net_buf_simple *buf,
@@ -522,7 +535,21 @@ static uint8_t notify_handler(struct bt_conn *conn,
 			      const void *data, uint16_t length)
 {
 	uint16_t handle = params->value_handle;
-	struct bt_tbs_instance *tbs_inst = lookup_inst_by_handle(conn, handle);
+	struct find_inst_result find_result;
+	struct bt_tbs_instance *tbs_inst;
+	int err;
+
+	err = find_inst_by_handle(handle, &find_result);
+	if (err < 0) {
+		BT_DBG("Could not find instance with handle 0x%04x", handle);
+		return BT_GATT_ITER_STOP;
+	}
+
+	__ASSERT(conn == NULL ||
+		 bt_conn_index(conn) == tbs_server_index(find_result.srv_inst),
+		 "invalid srv_inst %p for conn %p", find_result.srv_inst, (void *)conn);
+
+	tbs_inst = find_result.inst;
 
 	if (data == NULL) {
 		BT_DBG("[UNSUBSCRIBED] 0x%04X", params->value_handle);
