@@ -14,4 +14,6 @@ struct bt_conn {
 	struct bt_conn_info info;
 };
 
+void mock_bt_conn_disconnected(struct bt_conn *conn);
+
 #endif /* MOCKS_CONN_H_ */

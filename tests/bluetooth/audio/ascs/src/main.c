@@ -220,3 +220,37 @@ ZTEST_F(ascs_test_suite, test_abort_client_operation_if_callback_not_registered)
 		      param->response_code);
 	zassert_equal(0x00, param->reason, "unexpected Reason 0x%02x", param->reason);
 }
+
+ZTEST_F(ascs_test_suite, test_release_ase_on_acl_disconnection)
+{
+	const struct test_ase_chrc_value_hdr *hdr;
+	const struct bt_gatt_attr *ase;
+	struct bt_bap_stream *stream = &fixture->stream;
+	struct bt_conn *conn = &fixture->conn;
+	uint8_t ase_id;
+
+	if (IS_ENABLED(CONFIG_BT_ASCS_ASE_SNK)) {
+		ase = fixture->ase_snk.attr;
+		ase_id = fixture->ase_snk.id;
+	} else {
+		ase = fixture->ase_src.attr;
+		ase_id = fixture->ase_src.id;
+	}
+
+	zexpect_not_null(ase);
+	zexpect_true(ase_id != 0x00);
+
+	bt_bap_unicast_server_register_cb(&mock_bap_unicast_server_cb);
+
+	/* Set ASE to non-idle state */
+	test_preamble_state_qos_configured(conn, ase_id, stream);
+
+	/* Mock ACL disconnection */
+	mock_bt_conn_disconnected(conn);
+
+	/* Expected to notify the upper layers */
+	expect_bt_bap_unicast_server_cb_release_called_once(stream);
+	expect_bt_bap_stream_ops_released_called_once(stream);
+
+	bt_bap_unicast_server_unregister_cb(&mock_bap_unicast_server_cb);
+}
