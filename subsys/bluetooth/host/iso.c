@@ -1071,9 +1071,9 @@ int bt_iso_server_register(struct bt_iso_server *server)
 	}
 
 	/* Check if controller is ISO capable */
-	if (!BT_FEAT_LE_CIS_PERIPHERAL(bt_dev.le.features)) {
-		return -ENOTSUP;
-	}
+	// if (!BT_FEAT_LE_CIS_PERIPHERAL(bt_dev.le.features)) {
+	// 	return -ENOTSUP;
+	// }
 
 	if (iso_server) {
 		return -EADDRINUSE;
