@@ -12,6 +12,12 @@ config BT_ASCS
 	  This option enables support for Audio Stream Control Service.
 
 if BT_ASCS
+config BT_ASCS_STACK_SIZE
+	int "ASCS thread stack size"
+	default 1024
+	help
+	  ASCS thread stack size.
+
 config BT_ASCS_ASE_SNK_COUNT
 	int "Number of Audio Stream Endpoint Sink Characteristics"
 	default 2
