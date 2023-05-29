@@ -15,7 +15,12 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
+#include "zephyr/bluetooth/att.h"
 #include "zephyr/bluetooth/iso.h"
+#include "zephyr/net/buf.h"
+#include "zephyr/sys/__assert.h"
+#include "zephyr/sys/util.h"
+#include <stdint.h>
 #include <zephyr/bluetooth/audio/audio.h>
 #include <zephyr/bluetooth/audio/bap.h>
 #include <zephyr/bluetooth/audio/pacs.h>
@@ -54,6 +59,12 @@ BUILD_ASSERT(CONFIG_BT_ASCS_MAX_ACTIVE_ASES <= MAX(MAX_ASES_SESSIONS,
 #define ASE_UUID(_id) \
 	(_id > CONFIG_BT_ASCS_ASE_SNK_COUNT ? BT_UUID_ASCS_ASE_SRC : BT_UUID_ASCS_ASE_SNK)
 #define ASE_COUNT (CONFIG_BT_ASCS_ASE_SNK_COUNT + CONFIG_BT_ASCS_ASE_SRC_COUNT)
+
+/* The service allows operations with paired devices only.
+ * For now, the context is kept for connected devices only, thus the number of contexts is
+ * equal to maximum number of simultaneous connections to paired devices.
+ */
+#define ASCS_MAX_CP_WRITES MIN(CONFIG_BT_MAX_CONN, CONFIG_BT_MAX_PAIRED)
 
 static struct bt_ascs_ase {
 	struct bt_conn *conn;
@@ -2743,60 +2754,73 @@ static ssize_t ascs_release(struct bt_conn *conn, struct net_buf_simple *buf)
 	return buf->size;
 }
 
-static ssize_t ascs_cp_write(struct bt_conn *conn,
-			     const struct bt_gatt_attr *attr, const void *data,
-			     uint16_t len, uint16_t offset, uint8_t flags)
+enum ascs_event_type {
+	ASCS_EVENT_CP_WRITE,
+};
+
+struct ascs_event_cp_write {
+	struct bt_conn *conn;
+	struct net_buf *data;
+};
+
+struct ascs_event {
+	enum ascs_event_type type;
+	union {
+		struct ascs_event_cp_write cp_write;
+	};
+};
+
+#define ASCS_MAX_EVENTS 10
+
+K_MSGQ_DEFINE(ascs_msgq, sizeof(struct ascs_event), ASCS_MAX_EVENTS, sizeof(uint32_t));
+
+static void ascs_event_cp_write_destroy(struct ascs_event_cp_write *evt)
 {
+	bt_conn_unref(evt->conn);
+	evt->conn = NULL;
+
+	net_buf_unref(evt->data);
+	evt->data = NULL;
+}
+
+static void handle_event_cp_write(struct ascs_event_cp_write *evt)
+{
+	struct net_buf_simple *buf = &evt->data->b;
+	struct bt_conn *conn = evt->conn;
 	const struct bt_ascs_ase_cp *req;
-	struct net_buf_simple buf;
 	ssize_t ret;
 
-	if (flags & BT_GATT_WRITE_FLAG_PREPARE) {
-		/* Return 0 to allow long writes */
-		return 0;
-	}
+	req = net_buf_simple_pull_mem(buf, sizeof(*req));
 
-	if (offset != 0 && (flags & BT_GATT_WRITE_FLAG_EXECUTE) == 0) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-	}
-
-	if (len < sizeof(*req)) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
-	}
-
-	net_buf_simple_init_with_data(&buf, (void *) data, len);
-
-	req = net_buf_simple_pull_mem(&buf, sizeof(*req));
-
-	LOG_DBG("conn %p attr %p buf %p len %u op %s (0x%02x)",
-		(void *)conn, attr, data, len, bt_ascs_op_str(req->op), req->op);
+	LOG_DBG("conn %p buf %p len %u op %s (0x%02x)",
+		(void *)conn, buf, buf->len, bt_ascs_op_str(req->op), req->op);
 
 	ascs_cp_rsp_init(req->op);
 
 	switch (req->op) {
 	case BT_ASCS_CONFIG_OP:
-		ret = ascs_config(conn, &buf);
+		ret = ascs_config(conn, buf);
 		break;
 	case BT_ASCS_QOS_OP:
-		ret = ascs_qos(conn, &buf);
+		ret = ascs_qos(conn, buf);
 		break;
 	case BT_ASCS_ENABLE_OP:
-		ret = ascs_enable(conn, &buf);
+		ret = ascs_enable(conn, buf);
 		break;
 	case BT_ASCS_START_OP:
-		ret = ascs_start(conn, &buf);
+		ret = ascs_start(conn, buf);
 		break;
 	case BT_ASCS_DISABLE_OP:
-		ret = ascs_disable(conn, &buf);
+		ret = ascs_disable(conn, buf);
 		break;
 	case BT_ASCS_STOP_OP:
-		ret = ascs_stop(conn, &buf);
+		ret = ascs_stop(conn, buf);
 		break;
 	case BT_ASCS_METADATA_OP:
-		ret = ascs_metadata(conn, &buf);
+		ret = ascs_metadata(conn, buf);
 		break;
 	case BT_ASCS_RELEASE_OP:
-		ret = ascs_release(conn, &buf);
+		ret = ascs_release(conn, buf);
 		break;
 	default:
 		ascs_cp_rsp_add(BT_ASCS_ASE_ID_NONE, BT_BAP_ASCS_RSP_CODE_NOT_SUPPORTED,
@@ -2812,6 +2836,76 @@ static ssize_t ascs_cp_write(struct bt_conn *conn,
 
 respond:
 	control_point_notify(conn, rsp_buf.data, rsp_buf.len);
+
+	ascs_event_cp_write_destroy(evt);
+}
+
+static void ascs_event_handler(struct ascs_event *event)
+{
+	switch (event->type) {
+	case ASCS_EVENT_CP_WRITE:
+		return handle_event_cp_write(&event->cp_write);
+	}
+}
+
+static void ascs_thread(void)
+{
+	struct ascs_event event;
+
+	while (true) {
+		k_msgq_get(&ascs_msgq, &event, K_FOREVER);
+		ascs_event_handler(&event);
+	}
+}
+
+NET_BUF_POOL_DEFINE(cp_write_buf_pool, ASCS_MAX_CP_WRITES, BT_ATT_BUF_SIZE, 0, NULL);
+
+static int ascs_event_cp_write(struct bt_conn *conn, const void *data, uint16_t len)
+{
+	struct ascs_event event;
+	int err;
+
+	event.type = ASCS_EVENT_CP_WRITE;
+	event.cp_write.data = net_buf_alloc(&cp_write_buf_pool, K_NO_WAIT);
+	if (event.cp_write.data == NULL) {
+		return -ENOMEM;
+	}
+
+	net_buf_add_mem(event.cp_write.data, data, len);
+	event.cp_write.conn = bt_conn_ref(conn);
+
+	err  = k_msgq_put(&ascs_msgq, &event, K_NO_WAIT);
+	if (err < 0) {
+		ascs_event_cp_write_destroy(&event.cp_write);
+		return err;
+	}
+
+	return 0;
+}
+
+static ssize_t ascs_cp_write(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr, const void *data,
+			     uint16_t len, uint16_t offset, uint8_t flags)
+{
+	int err;
+
+	if (flags & BT_GATT_WRITE_FLAG_PREPARE) {
+		/* Return 0 to allow long writes */
+		return 0;
+	}
+
+	if (offset != 0 && (flags & BT_GATT_WRITE_FLAG_EXECUTE) == 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	if (len < sizeof(const struct bt_ascs_ase_cp)) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+
+	err = ascs_event_cp_write(conn, data, len);
+	if (err < 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
+	}
 
 	return len;
 }
@@ -2908,4 +3002,7 @@ void bt_ascs_cleanup(void)
 		unicast_server_cb = NULL;
 	}
 }
+
+K_THREAD_DEFINE(ascs, CONFIG_BT_ASCS_STACK_SIZE, ascs_thread, NULL, NULL, NULL,
+		CONFIG_SYSTEM_WORKQUEUE_PRIORITY, 0, 0);
 #endif /* BT_BAP_UNICAST_SERVER */
