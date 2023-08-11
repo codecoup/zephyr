@@ -52,12 +52,8 @@ static void active_preset_index_cfg_changed(const struct bt_gatt_attr *attr, uin
 #if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
 struct has_client;
 
-/* Active preset notification work */
-static void active_preset_work_process(struct k_work *work);
-static K_WORK_DEFINE(active_preset_work, active_preset_work_process);
-
-static void process_control_point_work(struct k_work *work);
-static void read_presets_req_free(struct has_client *client);
+static int read_preset_response(struct has_client *client);
+static int list_current_presets(struct has_client *client);
 static ssize_t write_control_point(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				   const void *data, uint16_t len, uint16_t offset, uint8_t flags);
 
@@ -115,8 +111,6 @@ static ssize_t read_features(struct bt_conn *conn, const struct bt_gatt_attr *at
 		      read_features, NULL, NULL),
 #endif /* CONFIG_BT_HAS_FEATURES_NOTIFIABLE */
 
-
-
 #if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
 #if defined(CONFIG_BT_HAS_PRESET_CONTROL_POINT_NOTIFIABLE)
 #define BT_HAS_CHR_PRESET_CONTROL_POINT \
@@ -159,10 +153,6 @@ static struct bt_gatt_attr has_attrs[] = {
 static struct bt_gatt_service has_svc;
 
 #if defined(CONFIG_BT_HAS_FEATURES_NOTIFIABLE)
-/* Features notification work */
-static void features_work_process(struct k_work *work);
-static K_WORK_DEFINE(features_work, features_work_process);
-
 #define FEATURES_ATTR &has_attrs[2]
 #if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
 #define PRESET_CONTROL_POINT_ATTR &has_attrs[5]
@@ -176,11 +166,14 @@ static K_WORK_DEFINE(features_work, features_work_process);
 #endif /* CONFIG_BT_HAS_FEATURES_NOTIFIABLE */
 
 #if defined(CONFIG_BT_HAS_PRESET_SUPPORT) || defined(CONFIG_BT_HAS_FEATURES_NOTIFIABLE)
-enum {
-	FLAG_ACTIVE_INDEX_CHANGED,
-	FLAG_CONTROL_POINT_NOTIFY,
-	FLAG_FEATURES_CHANGED,
-	FLAG_NUM,
+static void notify_work_handler(struct k_work *work);
+
+enum has_notify {
+	NOTIFY_ACTIVE_INDEX,
+	NOTIFY_READ_PRESET_RESPONSE,
+	NOTIFY_CURRENT_PRESET_LIST,
+	NOTIFY_FEATURES,
+	NOTIFY_NUM,
 };
 
 static struct has_client {
@@ -195,9 +188,9 @@ static struct has_client {
 
 	uint8_t preset_changed_index_next;
 	struct bt_has_cp_read_presets_req read_presets_req;
-	struct k_work control_point_work;
+	struct k_work_delayable notify_work;
 #endif /* CONFIG_BT_HAS_PRESET_SUPPORT */
-	ATOMIC_DEFINE(flags, FLAG_NUM);
+	ATOMIC_DEFINE(notify, NOTIFY_NUM);
 } has_client_list[BT_HAS_MAX_CONN];
 
 static struct has_client *client_get_or_new(struct bt_conn *conn)
@@ -219,26 +212,22 @@ static struct has_client *client_get_or_new(struct bt_conn *conn)
 
 	client->conn = bt_conn_ref(conn);
 
-#if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
-	k_work_init(&client->control_point_work, process_control_point_work);
-#endif /* CONFIG_BT_HAS_PRESET_SUPPORT */
+#if defined(CONFIG_BT_HAS_PRESET_SUPPORT) || defined(CONFIG_BT_HAS_FEATURES_NOTIFIABLE)
+	k_work_init_delayable(&client->notify_work, notify_work_handler);
+#endif /* CONFIG_BT_HAS_PRESET_SUPPORT || CONFIG_BT_HAS_FEATURES_NOTIFIABLE */
 
 	return client;
 }
 
 static void client_free(struct has_client *client)
 {
-#if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
-	(void)k_work_cancel(&client->control_point_work);
-	read_presets_req_free(client);
-#endif /* CONFIG_BT_HAS_PRESET_SUPPORT */
+#if defined(CONFIG_BT_HAS_PRESET_SUPPORT) || defined(CONFIG_BT_HAS_FEATURES_NOTIFIABLE)
+	(void)k_work_cancel_delayable(&client->notify_work);
+#endif /* CONFIG_BT_HAS_PRESET_SUPPORT || CONFIG_BT_HAS_FEATURES_NOTIFIABLE */
 
-	atomic_clear_bit(client->flags, FLAG_CONTROL_POINT_NOTIFY);
-	atomic_clear_bit(client->flags, FLAG_ACTIVE_INDEX_CHANGED);
-	atomic_clear_bit(client->flags, FLAG_FEATURES_CHANGED);
+	atomic_clear(client->notify);
 
 	bt_conn_unref(client->conn);
-
 	client->conn = NULL;
 }
 
@@ -273,25 +262,9 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
 		return;
 	}
 
-#if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
-	/* Notify after reconnection */
-	if (atomic_test_bit(client->flags, FLAG_ACTIVE_INDEX_CHANGED)) {
-		/* Emit active preset notification */
-		k_work_submit(&active_preset_work);
+	if (atomic_get(client->notify) != 0) {
+		k_work_reschedule(&client->notify_work, K_NO_WAIT);
 	}
-
-	if (atomic_test_and_clear_bit(client->flags, FLAG_CONTROL_POINT_NOTIFY)) {
-		/* Emit preset changed notifications */
-		k_work_submit(&client->control_point_work);
-	}
-#endif /* CONFIG_BT_HAS_PRESET_SUPPORT */
-
-#if defined(CONFIG_BT_HAS_FEATURES_NOTIFIABLE)
-	if (atomic_test_bit(client->flags, FLAG_FEATURES_CHANGED)) {
-		/* Emit features changed notification */
-		k_work_submit(&features_work);
-	}
-#endif /* CONFIG_BT_HAS_FEATURES_NOTIFIABLE */
 }
 
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -328,6 +301,89 @@ BT_CONN_CB_DEFINE(conn_cb) = {
 	.disconnected = disconnected,
 	.security_changed = security_changed,
 };
+
+static void notify_work_reschedule(struct has_client *client, enum has_notify notify,
+				   k_timeout_t delay)
+{
+	int err;
+
+	atomic_set_bit(client->notify, notify);
+
+	if (client->conn == NULL) {
+		return;
+	}
+
+	err = k_work_reschedule(&client->notify_work, delay);
+	if (err < 0) {
+		LOG_ERR("Failed to reschedule notification work err %d", err);
+	}
+}
+
+static void notify_work_handler(struct k_work *work)
+{
+	struct has_client *client = CONTAINER_OF(work, struct has_client, notify_work);
+	int err;
+
+#if defined(CONFIG_BT_HAS_FEATURES_NOTIFIABLE)
+	if (atomic_test_and_clear_bit(client->notify, NOTIFY_FEATURES) &&
+	    bt_gatt_is_subscribed(client->conn, FEATURES_ATTR, BT_GATT_CCC_NOTIFY)) {
+		err = bt_gatt_notify(client->conn, FEATURES_ATTR, &has.features,
+				     sizeof(has.features));
+		if (err == -ENOMEM) {
+			notify_work_reschedule(client, NOTIFY_FEATURES,
+					       K_USEC(BT_AUDIO_NOTIFY_RETRY_DELAY_US));
+		} else if (err < 0) {
+			LOG_ERR("Notify features err %d", err);
+		}
+	}
+#endif /* CONFIG_BT_HAS_FEATURES_NOTIFIABLE */
+
+#if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
+	if (atomic_test_and_clear_bit(client->notify, NOTIFY_READ_PRESET_RESPONSE)) {
+		err = read_preset_response(client);
+		if (err == -ENOMEM) {
+			notify_work_reschedule(client, NOTIFY_READ_PRESET_RESPONSE,
+					       K_USEC(BT_AUDIO_NOTIFY_RETRY_DELAY_US));
+		} else if (err < 0) {
+			LOG_ERR("Notify read preset response err %d", err);
+		}
+	} else if (atomic_test_and_clear_bit(client->notify, NOTIFY_CURRENT_PRESET_LIST)) {
+		err = list_current_presets(client);
+		if (err == -ENOMEM) {
+			notify_work_reschedule(client, NOTIFY_CURRENT_PRESET_LIST,
+					       K_USEC(BT_AUDIO_NOTIFY_RETRY_DELAY_US));
+		} else if (err < 0) {
+			LOG_ERR("Notify generic update all presets err %d", err);
+		}
+	}
+
+	if (atomic_test_and_clear_bit(client->notify, NOTIFY_ACTIVE_INDEX) &&
+	    bt_gatt_is_subscribed(client->conn, ACTIVE_PRESET_INDEX_ATTR, BT_GATT_CCC_NOTIFY)) {
+		err = bt_gatt_notify(client->conn, ACTIVE_PRESET_INDEX_ATTR,
+				     &has.active_index, sizeof(has.active_index));
+		if (err == -ENOMEM) {
+			notify_work_reschedule(client, NOTIFY_ACTIVE_INDEX,
+					       K_USEC(BT_AUDIO_NOTIFY_RETRY_DELAY_US));
+		} else if (err < 0) {
+			LOG_ERR("Notify active index err %d", err);
+		}
+	}
+#endif /* CONFIG_BT_HAS_PRESET_SUPPORT */
+}
+
+static void notify(struct has_client *client, enum has_notify notify)
+{
+	if (client != NULL) {
+		notify_work_reschedule(client, notify, K_NO_WAIT);
+		return;
+	}
+
+	for (size_t i = 0U; i < ARRAY_SIZE(has_client_list); i++) {
+		client = &has_client_list[i];
+
+		notify_work_reschedule(client, notify, K_NO_WAIT);
+	}
+}
 #endif /* CONFIG_BT_HAS_PRESET_SUPPORT || CONFIG_BT_HAS_FEATURES_NOTIFIABLE */
 
 #if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
@@ -345,16 +401,6 @@ static struct has_preset {
 
 /* Number of registered presets */
 static uint8_t has_preset_num;
-
-static bool read_presets_req_pending_cp(const struct has_client *client)
-{
-	return client->read_presets_req.num_presets > 0;
-}
-
-static void read_presets_req_free(struct has_client *client)
-{
-	client->read_presets_req.num_presets = 0;
-}
 
 typedef uint8_t (*preset_func_t)(const struct has_preset *preset, void *user_data);
 
@@ -447,10 +493,8 @@ static void control_point_ntf_complete(struct bt_conn *conn, void *user_data)
 	LOG_DBG("conn %p", (void *)conn);
 
 	/* Resubmit if needed */
-	if (client != NULL &&
-	    (read_presets_req_pending_cp(client) ||
-	     atomic_test_and_clear_bit(client->flags, FLAG_CONTROL_POINT_NOTIFY))) {
-		k_work_submit(&client->control_point_work);
+	if (client != NULL && atomic_get(client->notify) != 0) {
+		k_work_reschedule(&client->notify_work, K_NO_WAIT);
 	}
 }
 
@@ -503,7 +547,7 @@ static int control_point_send_all(struct net_buf_simple *buf)
 
 		if (!client->conn) {
 			/* Mark preset changed operation as pending */
-			atomic_set_bit(client->flags, FLAG_CONTROL_POINT_NOTIFY);
+			atomic_set_bit(client->notify, NOTIFY_CURRENT_PRESET_LIST);
 			/* For simplicity we simply start with the first index,
 			 * rather than keeping detailed logs of which clients
 			 * have knowledge of which presets
@@ -601,74 +645,73 @@ static int bt_has_cp_generic_update(struct has_client *client, const struct has_
 	}
 }
 
-static void process_control_point_work(struct k_work *work)
+static int read_preset_response(struct has_client *client)
 {
-	struct has_client *client = CONTAINER_OF(work, struct has_client, control_point_work);
+	const struct has_preset *preset = NULL;
+	bool is_last = true;
 	int err;
 
-	if (!client->conn) {
-		return;
+	__ASSERT_NO_MSG(client != NULL);
+
+	preset_foreach(client->read_presets_req.start_index, BT_HAS_PRESET_INDEX_LAST,
+		       preset_found, &preset);
+
+	if (unlikely(preset == NULL)) {
+		return bt_has_cp_read_preset_rsp(client, NULL, BT_HAS_IS_LAST);
 	}
 
-	if (read_presets_req_pending_cp(client)) {
-		const struct has_preset *preset = NULL;
-		bool is_last = true;
-
-		preset_foreach(client->read_presets_req.start_index, BT_HAS_PRESET_INDEX_LAST,
-			       preset_found, &preset);
-
-		if (unlikely(preset == NULL)) {
-			(void)bt_has_cp_read_preset_rsp(client, NULL, 0x01);
-
-			return;
-		}
-
-		if (client->read_presets_req.num_presets > 1) {
-			const struct has_preset *next = NULL;
-
-			preset_foreach(preset->index + 1, BT_HAS_PRESET_INDEX_LAST,
-				       preset_found, &next);
-
-			is_last = next == NULL;
-
-		}
-
-		err = bt_has_cp_read_preset_rsp(client, preset, is_last);
-		if (err) {
-			LOG_ERR("bt_has_cp_read_preset_rsp failed (err %d)", err);
-		}
-
-		if (err || is_last) {
-			read_presets_req_free(client);
-		} else {
-			client->read_presets_req.start_index = preset->index + 1;
-			client->read_presets_req.num_presets--;
-		}
-	} else {
-		const struct has_preset *preset = NULL;
+	if (client->read_presets_req.num_presets > 1) {
 		const struct has_preset *next = NULL;
-		bool is_last = true;
 
-		preset_foreach(client->preset_changed_index_next,
-			       BT_HAS_PRESET_INDEX_LAST, preset_found, &preset);
-
-		if (preset == NULL) {
-			return;
-		}
-
-		preset_foreach(preset->index + 1, BT_HAS_PRESET_INDEX_LAST,
-			       preset_found, &next);
+		preset_foreach(preset->index + 1, BT_HAS_PRESET_INDEX_LAST, preset_found, &next);
 
 		is_last = next == NULL;
 
-		err = bt_has_cp_generic_update(client, preset, is_last);
-		if (err) {
-			LOG_ERR("bt_has_cp_read_preset_rsp failed (err %d)", err);
-		} else if (!is_last) {
-			client->preset_changed_index_next = preset->index + 1;
-			atomic_set_bit(client->flags, FLAG_CONTROL_POINT_NOTIFY);
-		}
 	}
+
+	err = bt_has_cp_read_preset_rsp(client, preset, is_last);
+	if (err != 0 || is_last) {
+		return err;
+	}
+
+	client->read_presets_req.start_index = preset->index + 1;
+	client->read_presets_req.num_presets--;
+
+	notify_work_reschedule(client, NOTIFY_READ_PRESET_RESPONSE,
+			       K_USEC(BT_AUDIO_NOTIFY_RETRY_DELAY_US));
+
+	return 0;
+}
+
+static int list_current_presets(struct has_client *client)
+{
+	const struct has_preset *preset = NULL;
+	const struct has_preset *next = NULL;
+	bool is_last = true;
+	int err;
+
+	preset_foreach(client->preset_changed_index_next,
+			BT_HAS_PRESET_INDEX_LAST, preset_found, &preset);
+
+	if (preset == NULL) {
+		return 0;
+	}
+
+	preset_foreach(preset->index + 1, BT_HAS_PRESET_INDEX_LAST,
+			preset_found, &next);
+
+	is_last = next == NULL;
+
+	err = bt_has_cp_generic_update(client, preset, is_last);
+	if (err != 0 || is_last) {
+		return err;
+	}
+	client->preset_changed_index_next = preset->index + 1;
+
+	notify_work_reschedule(client, NOTIFY_CURRENT_PRESET_LIST,
+			       K_USEC(BT_AUDIO_NOTIFY_RETRY_DELAY_US));
+
+	return 0;
 }
 
 static uint8_t handle_read_preset_req(struct bt_conn *conn, struct net_buf_simple *buf)
@@ -706,7 +749,7 @@ static uint8_t handle_read_preset_req(struct bt_conn *conn, struct net_buf_simpl
 	}
 
 	/* Reject if already in progress */
-	if (read_presets_req_pending_cp(client)) {
+	if (atomic_test_bit(client->notify, NOTIFY_READ_PRESET_RESPONSE)) {
 		return BT_HAS_ERR_OPERATION_NOT_POSSIBLE;
 	}
 
@@ -714,7 +757,7 @@ static uint8_t handle_read_preset_req(struct bt_conn *conn, struct net_buf_simpl
 	client->read_presets_req.start_index = req->start_index;
 	client->read_presets_req.num_presets = req->num_presets;
 
-	k_work_submit(&client->control_point_work);
+	notify(client, NOTIFY_READ_PRESET_RESPONSE);
 
 	return 0;
 }
@@ -798,42 +841,12 @@ static uint8_t handle_write_preset_name(struct bt_conn *conn, struct net_buf_sim
 	return BT_ATT_ERR_SUCCESS;
 }
 
-static void active_preset_work_process(struct k_work *work)
-{
-	const uint8_t active_index = bt_has_preset_active_get();
-
-	for (size_t i = 0U; i < ARRAY_SIZE(has_client_list); i++) {
-		struct has_client *client = &has_client_list[i];
-		int err;
-
-		if (client->conn == NULL) {
-			/* mark to notify on reconnect */
-			atomic_set_bit(client->flags, FLAG_ACTIVE_INDEX_CHANGED);
-			continue;
-		} else if (atomic_test_and_clear_bit(client->flags, FLAG_ACTIVE_INDEX_CHANGED)) {
-			err = bt_gatt_notify(client->conn, ACTIVE_PRESET_INDEX_ATTR, &active_index,
-					     sizeof(active_index));
-			if (err != 0) {
-				LOG_DBG("failed to notify active_index for %p: %d", client->conn,
-				     err);
-			}
-		}
-	}
-}
-
 static void preset_active_set(uint8_t index)
 {
 	if (index != has.active_index) {
 		has.active_index = index;
 
-		for (size_t i = 0U; i < ARRAY_SIZE(has_client_list); i++) {
-			struct has_client *client = &has_client_list[i];
-			/* mark to notify */
-			atomic_set_bit(client->flags, FLAG_ACTIVE_INDEX_CHANGED);
-		}
-
-		/* Emit active preset notification */
-		k_work_submit(&active_preset_work);
+		notify(NULL, NOTIFY_ACTIVE_INDEX);
 	}
 }
 
@@ -1267,26 +1280,6 @@ static int has_features_register(const struct bt_has_features_param *features)
 }
 
 #if defined(CONFIG_BT_HAS_FEATURES_NOTIFIABLE)
-static void features_work_process(struct k_work *work)
-{
-	for (size_t i = 0U; i < ARRAY_SIZE(has_client_list); i++) {
-		struct has_client *client = &has_client_list[i];
-		int err;
-
-		if (client->conn == NULL) {
-			/* mark to notify on reconnect */
-			atomic_set_bit(client->flags, FLAG_FEATURES_CHANGED);
-			continue;
-		} else if (atomic_test_and_clear_bit(client->flags, FLAG_FEATURES_CHANGED)) {
-			err = bt_gatt_notify(client->conn, FEATURES_ATTR, &has.features,
-					     sizeof(has.features));
-			if (err != 0) {
-				LOG_DBG("failed to notify features for %p: %d",	client->conn, err);
-			}
-		}
-	}
-}
-
 int bt_has_features_set(const struct bt_has_features_param *features)
 {
 	int err;
@@ -1308,16 +1301,7 @@ int bt_has_features_set(const struct bt_has_features_param *features)
 		return err;
 	}
 
-	for (size_t i = 0U; i < ARRAY_SIZE(has_client_list); i++) {
-		struct has_client *client = &has_client_list[i];
-
-		atomic_set_bit(client->flags, FLAG_FEATURES_CHANGED);
-	}
-
-	err = k_work_submit(&features_work);
-	if (err < 0) {
-		LOG_ERR("Failed to reschedule features notification err %d", err);
-	}
+	notify(NULL, NOTIFY_FEATURES);
 
 	return 0;
 }
