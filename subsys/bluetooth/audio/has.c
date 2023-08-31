@@ -16,6 +16,7 @@
 #include <zephyr/bluetooth/audio/pacs.h>
 #include <zephyr/bluetooth/audio/has.h>
 #include <zephyr/sys/check.h>
+#include <zephyr/sys/slist.h>
 
 #include "../bluetooth/host/conn_internal.h"
 #include "../bluetooth/host/hci_core.h"
@@ -65,14 +66,17 @@ static void preset_cp_cfg_changed(const struct bt_gatt_attr *attr, uint16_t valu
 static ssize_t read_active_preset_index(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 					void *buf, uint16_t len, uint16_t offset)
 {
+	uint8_t active_index;
+
 	LOG_DBG("conn %p attr %p offset %d", (void *)conn, attr, offset);
 
-	if (offset > sizeof(has.active_index)) {
+	if (offset > sizeof(active_index)) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, &has.active_index,
-				 sizeof(has.active_index));
+	active_index = bt_has_preset_active_get();
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &active_index, sizeof(active_index));
 }
 #endif /* CONFIG_BT_HAS_PRESET_SUPPORT */
 
@@ -359,8 +363,10 @@ static void notify_work_handler(struct k_work *work)
 
 	if (atomic_test_and_clear_bit(client->notify, NOTIFY_ACTIVE_INDEX) &&
 	    bt_gatt_is_subscribed(client->conn, ACTIVE_PRESET_INDEX_ATTR, BT_GATT_CCC_NOTIFY)) {
+		uint8_t active_index = bt_has_preset_active_get();
+
 		err = bt_gatt_notify(client->conn, ACTIVE_PRESET_INDEX_ATTR,
-				     &has.active_index, sizeof(has.active_index));
+				     &active_index, sizeof(active_index));
 		if (err == -ENOMEM) {
 			notify_work_reschedule(client, NOTIFY_ACTIVE_INDEX,
 					       K_USEC(BT_AUDIO_NOTIFY_RETRY_DELAY_US));
@@ -387,6 +393,8 @@ static void notify(struct has_client *client, enum has_notify notify)
 #endif /* CONFIG_BT_HAS_PRESET_SUPPORT || CONFIG_BT_HAS_FEATURES_NOTIFIABLE */
 
 #if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
+static struct has_preset *active_preset;
+
 /* HAS internal preset representation */
 static struct has_preset {
 	uint8_t index;
@@ -397,19 +405,20 @@ static struct has_preset {
 	const char *name;
 #endif /* CONFIG_BT_HAS_PRESET_NAME_DYNAMIC */
 	const struct bt_has_preset_ops *ops;
-} has_preset_list[CONFIG_BT_HAS_PRESET_COUNT];
+	sys_snode_t node;
+} preset_pool[CONFIG_BT_HAS_PRESET_COUNT];
 
-/* Number of registered presets */
-static uint8_t has_preset_num;
+static sys_slist_t preset_list = SYS_SLIST_STATIC_INIT(&preset_list);
+static sys_slist_t preset_free_list = SYS_SLIST_STATIC_INIT(&preset_free_list);
 
 typedef uint8_t (*preset_func_t)(const struct has_preset *preset, void *user_data);
 
 static void preset_foreach(uint8_t start_index, uint8_t end_index, preset_func_t func,
 			   void *user_data)
 {
-	for (size_t i = 0; i < ARRAY_SIZE(has_preset_list); i++) {
-		const struct has_preset *preset = &has_preset_list[i];
+	struct has_preset *preset, *tmp;
 
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&preset_list, preset, tmp, node) {
 		if (preset->index < start_index) {
 			continue;
 		}
@@ -433,57 +442,122 @@ static uint8_t preset_found(const struct has_preset *preset, void *user_data)
 	return BT_HAS_PRESET_ITER_STOP;
 }
 
-static int preset_index_compare(const void *p1, const void *p2)
+static void preset_insert(struct has_preset *preset)
 {
-	const struct has_preset *preset_1 = p1;
-	const struct has_preset *preset_2 = p2;
+	struct has_preset *tmp, *prev = NULL;
 
-	if (preset_1->index == BT_HAS_PRESET_INDEX_NONE) {
-		return 1;
+	SYS_SLIST_FOR_EACH_CONTAINER(&preset_list, tmp, node) {
+		if (tmp->index > preset->index) {
+			if (prev) {
+				sys_slist_insert(&preset_list, &prev->node, &preset->node);
+			} else {
+				sys_slist_prepend(&preset_list, &preset->node);
+			}
+			return;
+		}
+
+		prev = tmp;
 	}
 
-	if (preset_2->index == BT_HAS_PRESET_INDEX_NONE) {
-		return -1;
-	}
-
-	return preset_1->index - preset_2->index;
+	sys_slist_append(&preset_list, &preset->node);
 }
 
 static struct has_preset *preset_alloc(uint8_t index, enum bt_has_properties properties,
 				       const char *name, const struct bt_has_preset_ops *ops)
 {
-	struct has_preset *preset = NULL;
+	struct has_preset *preset;
+	sys_snode_t *node;
 
-	if (has_preset_num < ARRAY_SIZE(has_preset_list)) {
-		preset = &has_preset_list[has_preset_num];
-		preset->index = index;
-		preset->properties = properties;
-#if defined(CONFIG_BT_HAS_PRESET_NAME_DYNAMIC)
-		utf8_lcpy(preset->name, name, ARRAY_SIZE(preset->name));
-#else
-		preset->name = name;
-#endif /* CONFIG_BT_HAS_PRESET_NAME_DYNAMIC */
-		preset->ops = ops;
-
-		has_preset_num++;
-
-		/* sort the presets in index ascending order */
-		qsort(has_preset_list, has_preset_num, sizeof(*preset), preset_index_compare);
+	node = sys_slist_get(&preset_free_list);
+	if (node == NULL) {
+		return NULL;
 	}
+
+	preset = CONTAINER_OF(node, struct has_preset, node);
+	preset->index = index;
+	preset->properties = properties;
+#if defined(CONFIG_BT_HAS_PRESET_NAME_DYNAMIC)
+	utf8_lcpy(preset->name, name, ARRAY_SIZE(preset->name));
+#else
+	preset->name = name;
+#endif /* CONFIG_BT_HAS_PRESET_NAME_DYNAMIC */
+	preset->ops = ops;
+
+	preset_insert(preset);
 
 	return preset;
 }
 
 static void preset_free(struct has_preset *preset)
 {
-	preset->index = BT_HAS_PRESET_INDEX_NONE;
+	bool removed;
 
-	/* sort the presets in index ascending order */
-	if (has_preset_num > 1) {
-		qsort(has_preset_list, has_preset_num, sizeof(*preset), preset_index_compare);
+	removed = sys_slist_find_and_remove(&preset_list, &preset->node);
+	if (removed) {
+		sys_slist_append(&preset_free_list, &preset->node);
+	}
+}
+
+static struct has_preset *preset_get_prev(const struct has_preset *preset, bool wrap)
+{
+	struct has_preset *tmp, *prev = NULL;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&preset_list, tmp, node) {
+		if (tmp->index == preset->index) {
+			if (prev == NULL && wrap) {
+				sys_snode_t *node = sys_slist_peek_tail(&preset_list);
+
+				prev = CONTAINER_OF(node, struct has_preset, node);
+				if (prev == preset) {
+					return NULL;
+				}
+			}
+			break;
+		}
+		prev = tmp;
 	}
 
-	has_preset_num--;
+	return prev;
+}
+
+static struct has_preset *preset_lookup_index(uint8_t index)
+{
+	struct has_preset *preset;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&preset_list, preset, node) {
+		if (preset->index == index) {
+			return preset;
+		}
+	}
+
+	return NULL;
+}
+
+static struct has_preset *preset_get_next(struct has_preset *preset, bool wrap)
+{
+	struct has_preset *next;
+
+	next = SYS_SLIST_PEEK_NEXT_CONTAINER(preset, node);
+	if (next == NULL && wrap) {
+		next = SYS_SLIST_PEEK_HEAD_CONTAINER(&preset_list, next, node);
+		if (next == preset) {
+			return NULL;
+		}
+	}
+
+	return next;
+}
+
+static uint8_t preset_get_prev_index(const struct has_preset *preset)
+{
+	const struct has_preset *prev;
+
+	prev = preset_get_prev(preset, false);
+	if (prev == NULL) {
+		return BT_HAS_PRESET_INDEX_NONE;
+	}
+
+	return prev->index;
 }
 
 static void control_point_ntf_complete(struct bt_conn *conn, void *user_data)
@@ -592,23 +666,6 @@ static int bt_has_cp_read_preset_rsp(struct has_client *client, const struct has
 	return control_point_send(client, &buf);
 }
 
-static uint8_t get_prev_preset_index(const struct has_preset *preset)
-{
-	const struct has_preset *prev = NULL;
-
-	for (size_t i = 0; i < ARRAY_SIZE(has_preset_list); i++) {
-		const struct has_preset *tmp = &has_preset_list[i];
-
-		if (tmp->index == BT_HAS_PRESET_INDEX_NONE || tmp == preset) {
-			break;
-		}
-
-		prev = tmp;
-	}
-
-	return prev ? prev->index : BT_HAS_PRESET_INDEX_NONE;
-}
-
 static void preset_changed_prepare(struct net_buf_simple *buf, uint8_t change_id, uint8_t is_last)
 {
 	struct bt_has_cp_hdr *hdr;
@@ -633,7 +690,7 @@ static int bt_has_cp_generic_update(struct has_client *client, const struct has_
 	preset_changed_prepare(&buf, BT_HAS_CHANGE_ID_GENERIC_UPDATE, is_last);
 
 	generic_update = net_buf_simple_add(&buf, sizeof(*generic_update));
-	generic_update->prev_index = get_prev_preset_index(preset);
+	generic_update->prev_index = preset_get_prev_index(preset);
 	generic_update->index = preset->index;
 	generic_update->properties = preset->properties;
 	net_buf_simple_add_mem(&buf, preset->name, strlen(preset->name));
@@ -841,16 +898,16 @@ static uint8_t handle_write_preset_name(struct bt_conn *conn, struct net_buf_sim
 	return BT_ATT_ERR_SUCCESS;
 }
 
-static void preset_active_set(uint8_t index)
+static void preset_set_active(struct has_preset *preset)
 {
-	if (index != has.active_index) {
-		has.active_index = index;
+	if (active_preset != preset) {
+		active_preset = preset;
 
 		notify(NULL, NOTIFY_ACTIVE_INDEX);
 	}
 }
 
-static uint8_t preset_select(const struct has_preset *preset, bool sync)
+static uint8_t preset_select(struct has_preset *preset, bool sync)
 {
 	const int err = preset->ops->select(preset->index, sync);
 
@@ -869,15 +926,20 @@ static uint8_t preset_select(const struct has_preset *preset, bool sync)
 		return BT_ATT_ERR_UNLIKELY;
 	}
 
-	preset_active_set(preset->index);
+	preset_set_active(preset);
 
 	return 0;
+}
+
+static bool is_preset_available(const struct has_preset *preset)
+{
+	return preset->properties & BT_HAS_PROP_AVAILABLE;
 }
 
 static uint8_t handle_set_active_preset(struct net_buf_simple *buf, bool sync)
 {
 	const struct bt_has_cp_set_active_preset *pdu;
-	const struct has_preset *preset = NULL;
+	struct has_preset *preset;
 
 	if (buf->len < sizeof(*pdu)) {
 		return BT_HAS_ERR_INVALID_PARAM_LEN;
@@ -885,12 +947,12 @@ static uint8_t handle_set_active_preset(struct net_buf_simple *buf, bool sync)
 
 	pdu = net_buf_simple_pull_mem(buf, sizeof(*pdu));
 
-	preset_foreach(pdu->index, pdu->index, preset_found, &preset);
+	preset = preset_lookup_index(pdu->index);
 	if (preset == NULL) {
 		return BT_ATT_ERR_OUT_OF_RANGE;
 	}
 
-	if (!(preset->properties & BT_HAS_PROP_AVAILABLE)) {
+	if (!is_preset_available(preset)) {
 		return BT_HAS_ERR_OPERATION_NOT_POSSIBLE;
 	}
 
@@ -899,80 +961,52 @@ static uint8_t handle_set_active_preset(struct net_buf_simple *buf, bool sync)
 
 static uint8_t handle_set_next_preset(bool sync)
 {
-	const struct has_preset *next_avail = NULL;
-	const struct has_preset *first_avail = NULL;
+	struct has_preset *next, *tmp;
 
-	for (size_t i = 0; i < has_preset_num; i++) {
-		const struct has_preset *tmp = &has_preset_list[i];
+	if (active_preset == NULL) {
+		next = SYS_SLIST_PEEK_HEAD_CONTAINER(&preset_list, next, node);
+	} else {
+		next = preset_get_next(active_preset, true);
+	}
 
-		if (tmp->index == BT_HAS_PRESET_INDEX_NONE) {
+	tmp = next;
+	do {
+		if (next == NULL) {
 			break;
 		}
 
-		if (!(tmp->properties & BT_HAS_PROP_AVAILABLE)) {
-			continue;
+		if (is_preset_available(next)) {
+			return preset_select(next, sync);
 		}
 
-		if (tmp->index < has.active_index && !first_avail) {
-			first_avail = tmp;
-			continue;
-		}
-
-		if (tmp->index > has.active_index) {
-			next_avail = tmp;
-			break;
-		}
-	}
-
-	if (next_avail) {
-		return preset_select(next_avail, sync);
-	}
-
-	if (first_avail) {
-		return preset_select(first_avail, sync);
-	}
+		next = preset_get_next(next, true);
+	} while (tmp != next);
 
 	return BT_HAS_ERR_OPERATION_NOT_POSSIBLE;
 }
 
 static uint8_t handle_set_prev_preset(bool sync)
 {
-	const struct has_preset *prev_available = NULL;
-	const struct has_preset *last_available = NULL;
+	struct has_preset *prev, *tmp;
 
-	for (size_t i = 0; i < ARRAY_SIZE(has_preset_list); i++) {
-		const struct has_preset *tmp = &has_preset_list[i];
+	if (active_preset == NULL) {
+		prev = SYS_SLIST_PEEK_TAIL_CONTAINER(&preset_list, prev, node);
+	} else {
+		prev = preset_get_prev(active_preset, true);
+	}
 
-		if (tmp->index == BT_HAS_PRESET_INDEX_NONE) {
+	tmp = prev;
+	do {
+		if (prev == NULL) {
 			break;
 		}
 
-		if (!(tmp->properties & BT_HAS_PROP_AVAILABLE)) {
-			continue;
+		if (is_preset_available(prev)) {
+			return preset_select(prev, sync);
 		}
 
-		if (tmp->index < has.active_index) {
-			prev_available = tmp;
-			continue;
-		}
-
-		if (prev_available) {
-			break;
-		}
-
-		if (tmp->index > has.active_index) {
-			last_available = tmp;
-			continue;
-		}
-	}
-
-	if (prev_available) {
-		return preset_select(prev_available, sync);
-	}
-
-	if (last_available) {
-		return preset_select(last_available, sync);
-	}
+		prev = preset_get_prev(prev, true);
+	} while (tmp != prev);
 
 	return BT_HAS_ERR_OPERATION_NOT_POSSIBLE;
 }
@@ -1053,7 +1087,7 @@ static ssize_t write_control_point(struct bt_conn *conn, const struct bt_gatt_at
 
 int bt_has_preset_register(const struct bt_has_preset_register_param *param)
 {
-	struct has_preset *preset = NULL;
+	struct has_preset *preset;
 	size_t name_len;
 
 	CHECKIF(param == NULL) {
@@ -1092,7 +1126,7 @@ int bt_has_preset_register(const struct bt_has_preset_register_param *param)
 		return -EINVAL;
 	}
 
-	preset_foreach(param->index, param->index, preset_found, &preset);
+	preset = preset_lookup_index(param->index);
 	if (preset != NULL) {
 		return -EALREADY;
 	}
@@ -1107,7 +1141,7 @@ int bt_has_preset_register(const struct bt_has_preset_register_param *param)
 
 int bt_has_preset_unregister(uint8_t index)
 {
-	struct has_preset *preset = NULL;
+	struct has_preset *preset;
 
 	NET_BUF_SIMPLE_DEFINE(buf, sizeof(struct bt_has_cp_hdr) +
 			      sizeof(struct bt_has_cp_preset_changed) + sizeof(uint8_t));
@@ -1117,9 +1151,13 @@ int bt_has_preset_unregister(uint8_t index)
 		return -EINVAL;
 	}
 
-	preset_foreach(index, index, preset_found, &preset);
+	preset = preset_lookup_index(index);
 	if (preset == NULL) {
 		return -ENOENT;
+	}
+
+	if (preset == active_preset) {
+		return -EADDRINUSE;
 	}
 
 	preset_changed_prepare(&buf, BT_HAS_CHANGE_ID_PRESET_DELETED, BT_HAS_IS_LAST);
@@ -1134,7 +1172,7 @@ static int set_preset_availability(uint8_t index, bool available)
 {
 	NET_BUF_SIMPLE_DEFINE(buf, sizeof(struct bt_has_cp_hdr) +
 			      sizeof(struct bt_has_cp_preset_changed) + sizeof(uint8_t));
-	struct has_preset *preset = NULL;
+	struct has_preset *preset;
 	uint8_t change_id;
 
 	CHECKIF(index == BT_HAS_PRESET_INDEX_NONE) {
@@ -1142,7 +1180,7 @@ static int set_preset_availability(uint8_t index, bool available)
 		return -EINVAL;
 	}
 
-	preset_foreach(index, index, preset_found, &preset);
+	preset = preset_lookup_index(index);
 	if (preset == NULL) {
 		return -ENOENT;
 	}
@@ -1206,27 +1244,34 @@ void bt_has_preset_foreach(uint8_t index, bt_has_preset_func_t func, void *user_
 
 int bt_has_preset_active_set(uint8_t index)
 {
-	if (index != BT_HAS_PRESET_INDEX_NONE) {
-		struct has_preset *preset = NULL;
+	struct has_preset *preset;
 
-		preset_foreach(index, index, preset_found, &preset);
-		if (preset == NULL) {
-			return -ENOENT;
-		}
-
-		if (!(preset->properties & BT_HAS_PROP_AVAILABLE)) {
-			return -EINVAL;
-		}
+	if (index == BT_HAS_PRESET_INDEX_NONE) {
+		preset_set_active(NULL);
+		return 0;
 	}
 
-	preset_active_set(index);
+	preset = preset_lookup_index(index);
+	if (preset == NULL) {
+		return -ENOENT;
+	}
+
+	if (!is_preset_available(preset)) {
+		return -EINVAL;
+	}
+
+	preset_set_active(preset);
 
 	return 0;
 }
 
 uint8_t bt_has_preset_active_get(void)
 {
-	return has.active_index;
+	if (active_preset == NULL) {
+		return BT_HAS_PRESET_INDEX_NONE;
+	}
+
+	return active_preset->index;
 }
 
 int bt_has_preset_name_change(uint8_t index, const char *name)
@@ -1334,6 +1379,14 @@ int bt_has_register(const struct bt_has_features_param *features)
 		LOG_DBG("HAS service register failed: %d", err);
 		return err;
 	}
+
+#if defined(CONFIG_BT_HAS_PRESET_SUPPORT)
+	for (size_t i = 0; i < ARRAY_SIZE(preset_pool); i++) {
+		struct has_preset *preset = &preset_pool[i];
+
+		sys_slist_append(&preset_free_list, &preset->node);
+	}
+#endif /* CONFIG_BT_HAS_PRESET_SUPPORT */
 
 	has.registered = true;
 
