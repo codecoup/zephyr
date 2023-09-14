@@ -901,10 +901,10 @@ int bt_bap_broadcast_sink_sync(struct bt_bap_broadcast_sink *sink, uint32_t inde
 		return -EINVAL;
 	}
 
-	CHECKIF(indexes_bitfield & BIT(0)) {
-		LOG_DBG("BIT(0) is not a valid BIS index");
-		return -EINVAL;
-	}
+	// CHECKIF(indexes_bitfield & BIT(0)) {
+	// 	LOG_DBG("BIT(0) is not a valid BIS index");
+	// 	return -EINVAL;
+	// }
 
 	CHECKIF(streams == NULL) {
 		LOG_DBG("streams is NULL");
