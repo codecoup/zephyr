@@ -38,3 +38,9 @@ properties:
       - "PCLK32M"
       - "PCLK32M_HFXO"
       - "ACLK"
+
+  mclk-bypass:
+    type: boolean
+    description: |
+      The master clock generator will be be bypassed so the MCK clock
+      is derived directly from the input source.

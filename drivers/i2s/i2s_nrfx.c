@@ -101,8 +101,14 @@ static void find_suitable_clock(const struct i2s_nrfx_drv_cfg *drv_cfg,
 		}
 
 		if (IS_ENABLED(CONFIG_SOC_SERIES_NRF53X) || IS_ENABLED(CONFIG_SOC_SERIES_NRF54LX)) {
-			uint32_t requested_mck =
-				i2s_cfg->frame_clk_freq * ratios[r].ratio_val;
+			uint32_t requested_mck;
+
+			if (config->enable_bypass) {
+				requested_mck = src_freq;
+			} else {
+				requested_mck = i2s_cfg->frame_clk_freq * ratios[r].ratio_val;
+			}
+
 			/* As specified in the nRF5340 PS:
 			 *
 			 * MCKFREQ = 4096 * floor(f_MCK * 1048576 /
@@ -522,15 +528,13 @@ static int i2s_nrfx_configure(const struct device *dev, enum i2s_dir dir,
 	if (nrfx_cfg.mode == NRF_I2S_MODE_MASTER ||
 	    (nrf_i2s_mck_pin_get(drv_cfg->i2s.p_reg) & I2S_PSEL_MCK_CONNECT_Msk)
 	    == I2S_PSEL_MCK_CONNECT_Connected << I2S_PSEL_MCK_CONNECT_Pos) {
-		if (nrfx_cfg.enable_bypass == false) {
-			find_suitable_clock(drv_cfg, &nrfx_cfg, i2s_cfg);
-			/* Unless the PCLK32M source is used with the HFINT oscillator
-			 * (which is always available without any additional actions),
-			 * it is required to request the proper clock to be running
-			 * before starting the transfer itself.
-			 */
-			drv_data->request_clock = (drv_cfg->clk_src != PCLK32M);
-		}
+		find_suitable_clock(drv_cfg, &nrfx_cfg, i2s_cfg);
+		/* Unless the PCLK32M source is used with the HFINT oscillator
+		 * (which is always available without any additional actions),
+		 * it is required to request the proper clock to be running
+		 * before starting the transfer itself.
+		 */
+		drv_data->request_clock = (drv_cfg->clk_src != PCLK32M);
 	} else {
 		nrfx_cfg.mck_setup = NRF_I2S_MCK_DISABLED;
 		drv_data->request_clock = false;
@@ -927,6 +931,7 @@ static const struct i2s_driver_api i2s_nrf_drv_api = {
 
 #define I2S(idx) DT_NODELABEL(i2s##idx)
 #define I2S_CLK_SRC(idx) DT_STRING_TOKEN(I2S(idx), clock_source)
+#define I2S_MCLK_BYPASS(idx) DT_PROP_OR(I2S(idx), mclk_bypass, false)
 
 #define I2S_NRFX_DEVICE(idx)						     \
 	static struct i2s_buf tx_msgs##idx[CONFIG_I2S_NRFX_TX_BLOCK_COUNT];  \
@@ -950,10 +955,7 @@ static const struct i2s_driver_api i2s_nrf_drv_api = {
 		.nrfx_def_cfg.skip_psel_cfg = true,			     \
 		.pcfg = PINCTRL_DT_DEV_CONFIG_GET(I2S(idx)),		     \
 		.clk_src = I2S_CLK_SRC(idx),				     \
-		.nrfx_def_cfg.enable_bypass = true,			     \
-		.nrfx_def_cfg.clksrc = I2S_CONFIG_CLKCONFIG_CLKSRC_ACLK,     \
-		.nrfx_def_cfg.ratio = NRF_I2S_RATIO_256X,		     \
-		.nrfx_def_cfg.mck_setup = NRF_I2S_MCK_32MDIV8,		     \
+		.nrfx_def_cfg.enable_bypass = I2S_MCLK_BYPASS(idx),	     \
 	};								     \
 	static struct i2s_nrfx_drv_data i2s_nrfx_data##idx = {		     \
 		.state = I2S_STATE_READY,				     \
