@@ -100,6 +100,14 @@ static ATOMIC_DEFINE(scan_delegator_flags, SCAN_DELEGATOR_FLAG_NUM);
 static struct bt_bap_scan_delegator_inst scan_delegator;
 static struct bt_bap_scan_delegator_cb *scan_delegator_cbs;
 
+/* Custom BASS Service Variables */
+static const struct bt_uuid_128 cbass_uuid = BT_UUID_INIT_128(
+	BT_UUID_128_ENCODE(0x31362fb2, 0x7f24, 0x4ba2, 0xb2a7, 0xe83f9dda8a78));
+static const struct bt_uuid_128 cbass_control_point_uuid = BT_UUID_INIT_128(
+	BT_UUID_128_ENCODE(0x8944f53e, 0x992a, 0x4f5b, 0x9cdf, 0xb74a33c65130));
+static const struct bt_uuid_128 cbass_recv_state_uuid = BT_UUID_INIT_128(
+	BT_UUID_128_ENCODE(0x85482747, 0x6503, 0x40ca, 0xa8f8, 0x457a3b6abfd3));
+
 /**
  * @brief Returns whether a value's bits is a subset of another value's bits
  *
@@ -181,7 +189,15 @@ static void bass_notify_receive_state(struct bt_conn *conn,
 				  ntf_size);
 
 	if (err != 0 && err != -ENOTCONN) {
-		LOG_DBG("Could not notify receive state: %d", err);
+		LOG_DBG("Could not notify BASS receive state: %d", err);
+	}
+
+	err = bt_gatt_notify_uuid(NULL, &cbass_recv_state_uuid.uuid,
+				  internal_state->attr, read_buf.data,
+				  ntf_size);
+
+	if (err != 0 && err != -ENOTCONN) {
+		LOG_DBG("Could not notify CBASS receive state: %d", err);
 	}
 }
 
@@ -1183,6 +1199,33 @@ static struct bt_gatt_attr attr_bass_svc[] = {
 
 static struct bt_gatt_service bass_svc = BT_GATT_SERVICE(attr_bass_svc);
 
+#define CBASS_RECEIVE_STATE_CHARACTERISTIC(idx) \
+	BT_GATT_CHARACTERISTIC(&cbass_recv_state_uuid.uuid, \
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,\
+			       BT_GATT_PERM_READ, \
+			       read_recv_state, NULL, \
+			       ((struct bt_audio_attr_user_data[]) { \
+			       BT_AUDIO_ATTR_USER_DATA_INIT(NULL, NULL, UINT_TO_POINTER(idx)), \
+			       })), \
+	BT_GATT_CCC(recv_state_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
+
+static struct bt_gatt_attr attr_cbass_svc[] = {
+	BT_GATT_PRIMARY_SERVICE(&cbass_uuid.uuid),
+	BT_GATT_CHARACTERISTIC(&cbass_control_point_uuid.uuid,
+				  BT_GATT_CHRC_WRITE_WITHOUT_RESP | BT_GATT_CHRC_WRITE,
+				  BT_GATT_PERM_WRITE,
+				  NULL, write_control_point, NULL),
+	CBASS_RECEIVE_STATE_CHARACTERISTIC(0),
+#if CONFIG_BT_BAP_SCAN_DELEGATOR_RECV_STATE_COUNT > 1
+	CBASS_RECEIVE_STATE_CHARACTERISTIC(1),
+#if CONFIG_BT_BAP_SCAN_DELEGATOR_RECV_STATE_COUNT > 2
+	CBASS_RECEIVE_STATE_CHARACTERISTIC(2)
+#endif /* CONFIG_BT_BAP_SCAN_DELEGATOR_RECV_STATE_COUNT > 2 */
+#endif /* CONFIG_BT_BAP_SCAN_DELEGATOR_RECV_STATE_COUNT > 1 */
+};
+
+static struct bt_gatt_service cbass_svc = BT_GATT_SERVICE(attr_cbass_svc);
+
 static int bass_register(void)
 {
 	int err;
@@ -1190,6 +1233,11 @@ static int bass_register(void)
 	err = bt_gatt_service_register(&bass_svc);
 	if (err) {
 		LOG_DBG("Failed to register BASS service (err %d)", err);
+	}
+
+	err |= bt_gatt_service_register(&cbass_svc);
+	if (err) {
+		LOG_DBG("Failed to register CBASS service (err %d)", err);
 		return err;
 	}
 
@@ -1205,6 +1253,11 @@ static int bass_unregister(void)
 	err = bt_gatt_service_unregister(&bass_svc);
 	if (err) {
 		LOG_DBG("Failed to unregister BASS service (err %d)", err);
+	}
+
+	err |= bt_gatt_service_unregister(&cbass_svc);
+	if (err) {
+		LOG_DBG("Failed to unregister CBASS service (err %d)", err);
 		return err;
 	}
 
